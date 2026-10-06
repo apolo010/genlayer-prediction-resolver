@@ -1,0 +1,11 @@
+{
+  "name": "genlayer-prediction-resolver",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "deploy": "genlayer deploy --contract contracts/prediction_resolver.py"
+  },
+  "devDependencies": {
+    "genlayer-js": "^1.1.8"
+  }
+}

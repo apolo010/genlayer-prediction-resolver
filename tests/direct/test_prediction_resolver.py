@@ -2,25 +2,24 @@
 
 import json
 
-from tests.direct.conftest import CONTRACT, to_hex
-
-PAST = "2026-01-01T00:00:00Z"
-FUTURE = "2099-01-01T00:00:00Z"
-CG_API = r".*api\.coingecko\.com/api/v3/simple/price.*"
-CG_PAGE = r".*coingecko\.com/en/coins/.*"
-NEWS = r".*example\.org/news.*"
+from tests.direct.conftest import (
+    CG_API,
+    CG_PAGE,
+    CONTRACT,
+    FUTURE,
+    PAST,
+    mock_event,
+    mock_price,
+    to_hex,
+)
 
 
 def _mock_price(vm, usd):
-    vm.mock_web(CG_API, {"status": 200, "body": json.dumps({"bitcoin": {"usd": usd}})})
+    mock_price(vm, usd)
 
 
 def _mock_event(vm, outcome, evidence="source says so"):
-    vm.mock_web(NEWS, {"status": 200, "body": "Some article text"})
-    vm.mock_llm(
-        r".*impartial prediction-market resolver.*",
-        json.dumps({"outcome": outcome, "evidence": evidence}),
-    )
+    mock_event(vm, outcome, evidence)
 
 
 # ── creation ────────────────────────────────────────────────────────────────
@@ -286,7 +285,9 @@ def test_pagination_and_leaderboard_order(
 # ── consensus fix: validators derive their own outcome ─────────────────────
 
 
-def test_validator_rejects_opposite_outcome_within_tolerance(direct_vm, direct_deploy, direct_alice):
+def test_validator_rejects_opposite_outcome_within_tolerance(
+    direct_vm, direct_deploy, direct_alice
+):
     """Steward's scenario: leader just above target, validator just below."""
     c = direct_deploy(CONTRACT)
     direct_vm.sender = direct_alice
@@ -303,7 +304,8 @@ def test_validator_rejects_opposite_outcome_within_tolerance(direct_vm, direct_d
     # prices only 0.4 % apart -> old code would have accepted, now rejected
     direct_vm.clear_mocks()
     _mock_price(direct_vm, 49900)
-    assert direct_vm.run_validator(leader_result={"price_cents": 5010000, "outcome": "YES"}) is False
+    leader = {"price_cents": 5010000, "outcome": "YES"}
+    assert direct_vm.run_validator(leader_result=leader) is False
 
     # validator clearly on the same side -> accepts
     direct_vm.clear_mocks()

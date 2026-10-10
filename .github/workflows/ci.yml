@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  lint-and-test:
+    name: Lint and direct-mode tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Cache GenLayer toolchains
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/gltest-direct
+            ~/.cache/genvm-linter
+          key: genlayer-tools-${{ runner.os }}-v1
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Ruff
+        run: ruff check .
+
+      - name: GenVM contract lint
+        run: genvm-lint check contracts/prediction_resolver.py
+
+      - name: Direct-mode tests
+        run: pytest tests/direct/ -v

@@ -21,11 +21,10 @@ in their favour; per-user stats and a leaderboard are kept on-chain.
 """
 
 import json
-from datetime import datetime, timezone
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 from genlayer import *
-
 
 KIND_PRICE = "price"
 KIND_EVENT = "event"
@@ -82,24 +81,115 @@ def _fmt_iso(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+# u256 storage is 32 bytes. Larger targets must revert as a user error
+# rather than overflowing inside the storage codec.
+_U256_MAX = 2**256 - 1
+
+
+def _ascii_digits(text: str) -> bool:
+    return text.isascii() and text.isdigit()
+
+
 def _usd_to_cents(value) -> int:
     """Deterministic decimal-string -> integer cents (no floats).
 
     Accepts a string ("1234.5") or an int (CLIs often auto-type numbers).
+    At most two fractional digits: targets are stored exactly, not rounded.
     """
     if isinstance(value, bool) or not isinstance(value, (str, int)):
         raise gl.vm.UserError("Invalid USD amount")
     s = str(value).strip().replace(",", "").lstrip("$")
-    if s.count(".") > 1 or s == "":
+    # 78 digits covers every u256; longer input is rejected before int().
+    if len(s) > 80 or s.count(".") > 1 or s == "":
         raise gl.vm.UserError("Invalid USD amount")
     whole, _, frac = s.partition(".")
-    if not whole.isdigit() or (frac and not frac.isdigit()):
+    # str.isdigit() is true for non-ASCII digits such as "٢", and int() then
+    # raises ValueError. Require ASCII so bad input is always a UserError.
+    if not _ascii_digits(whole) or (frac and not _ascii_digits(frac)):
         raise gl.vm.UserError("Invalid USD amount")
     if len(frac) > 2:
         raise gl.vm.UserError("At most 2 decimals allowed")
     cents = int(whole) * 100 + int((frac + "00")[:2])
     if cents <= 0:
         raise gl.vm.UserError("Target price must be positive")
+    if cents > _U256_MAX:
+        raise gl.vm.UserError("Invalid USD amount")
+    return cents
+
+
+def _apply_exponent(whole: str, frac: str, exp: int) -> tuple:
+    if exp == 0:
+        return whole, frac
+    digits = whole + frac
+    point = len(whole) + exp
+    if point <= 0:
+        return "0", ("0" * (-point)) + digits
+    if point >= len(digits):
+        return digits + ("0" * (point - len(digits))), ""
+    return digits[:point], digits[point:]
+
+
+def _text_to_cents(value) -> int:
+    """Parse an observed USD price to integer cents. No binary floats.
+
+    Half-up on the third decimal (5 rounds away from zero). Accepts the
+    shapes CoinGecko and the price-oracle prompt actually produce: plain
+    decimals, thousands separators, a leading ``$``, and a JSON exponent
+    (``1.5e4``). Raises ValueError when the text is not a usable price.
+    """
+    if isinstance(value, bool) or value is None:
+        raise ValueError("bad price")
+    if isinstance(value, int):
+        text = str(value)
+    elif isinstance(value, float):
+        # Shortest round-trip, not format(x, "f"): the latter re-exposes the
+        # binary error that this parser exists to avoid.
+        text = str(value)
+    else:
+        text = str(value)
+    s = text.strip().replace(",", "").replace("$", "").replace(" ", "")
+    if s.startswith("+"):
+        s = s[1:]
+    if s == "":
+        raise ValueError("bad price")
+    negative = False
+    if s.startswith("-"):
+        negative = True
+        s = s[1:]
+    exp = 0
+    if "e" in s.lower():
+        base, _, exp_s = s.lower().partition("e")
+        if exp_s in ("", "+", "-"):
+            raise ValueError("bad price")
+        exp_sign = 1
+        if exp_s[0] == "+":
+            exp_s = exp_s[1:]
+        elif exp_s[0] == "-":
+            exp_sign = -1
+            exp_s = exp_s[1:]
+        if not _ascii_digits(exp_s):
+            raise ValueError("bad price")
+        exp = exp_sign * int(exp_s)
+        s = base
+    if s.count(".") > 1 or s == ".":
+        raise ValueError("bad price")
+    whole, _, frac = s.partition(".")
+    if whole == "":
+        whole = "0"
+    if not _ascii_digits(whole) or (frac and not _ascii_digits(frac)):
+        raise ValueError("bad price")
+    whole, frac = _apply_exponent(whole, frac, exp)
+    whole = whole.lstrip("0") or "0"
+    # Larger than this, float() used to overflow to inf and the API path
+    # fell through. Keep that failure mode instead of storing a nonsense price.
+    if len(whole) > 18 or len(frac) > 40:
+        raise ValueError("bad price")
+    digits = frac + "000"
+    cents = int(whole) * 100 + int(digits[:2])
+    if digits[2] >= "5":
+        cents += 1
+    if negative:
+        cents = -cents
     return cents
 
 
@@ -126,7 +216,7 @@ def _parse_llm_json(raw) -> dict:
     start, end = s.find("{"), s.rfind("}") + 1
     if start >= 0 and end > start:
         s = s[start:end]
-    return json.loads(s)
+    return json.loads(s, parse_float=str, parse_int=str)
 
 
 # ─── non-deterministic helpers (only called inside nondet blocks) ────────────
@@ -142,9 +232,16 @@ def _fetch_price_cents(asset_id: str) -> int:
     try:
         resp = gl.nondet.web.get(api_url)
         if resp.status == 200 and resp.body:
-            data = json.loads(resp.body.decode("utf-8"))
-            usd = data[asset_id]["usd"]
-            cents = int(round(float(usd) * 100))
+            raw_body = resp.body
+            if isinstance(raw_body, str):
+                body = raw_body
+            else:
+                body = bytes(raw_body).decode("utf-8")
+            # Keep the JSON number's original spelling. json.loads() otherwise
+            # returns a binary float, and int(round(x * 100)) is wrong for
+            # values such as 1.005 (-> 100 cents) and 8.995 (-> 899 cents).
+            data = json.loads(body, parse_float=str, parse_int=str)
+            cents = _text_to_cents(data[asset_id]["usd"])
             if cents > 0:
                 return cents
     except Exception:
@@ -162,11 +259,10 @@ PAGE TEXT:
 
 Respond ONLY with JSON: {{"price_usd": "<price as a plain decimal string, e.g. 61234.56>"}}
 Use "0" if the price is not found."""
-    res = _parse_llm_json(gl.nondet.exec_prompt(task, response_format="json"))
-    raw_price = str(res.get("price_usd", "0")).replace(",", "").replace("$", "").strip()
     try:
-        cents = int(round(float(raw_price) * 100))
-    except ValueError:
+        res = _parse_llm_json(gl.nondet.exec_prompt(task, response_format="json"))
+        cents = _text_to_cents(res.get("price_usd", "0"))
+    except (TypeError, ValueError, KeyError):
         cents = 0
     if cents <= 0:
         raise gl.vm.UserError("Price not available")
@@ -191,7 +287,12 @@ SOURCE ({url}):
 
 Respond ONLY with JSON:
 {{"outcome": "YES" | "NO" | "UNRESOLVED", "evidence": "<one short sentence quoting or paraphrasing the source>"}}"""
-    res = _parse_llm_json(gl.nondet.exec_prompt(task, response_format="json"))
+    try:
+        res = _parse_llm_json(gl.nondet.exec_prompt(task, response_format="json"))
+    except (TypeError, ValueError):
+        # A garbled answer is the same as "not enough information": the
+        # deterministic caller reverts and the prediction stays open.
+        return {"outcome": "UNRESOLVED", "evidence": ""}
     outcome = str(res.get("outcome", "")).strip().upper()
     if outcome not in ("YES", "NO", "UNRESOLVED"):
         outcome = "UNRESOLVED"
@@ -299,15 +400,29 @@ class PredictionResolver(gl.Contract):
             }
 
         def validator_fn(leader_result) -> bool:
+            # A validator exception is treated as Disagree by run_nondet_unsafe.
+            # Return False explicitly so a malformed leader payload cannot
+            # crash the validator, and so direct-mode run_validator matches.
             if not isinstance(leader_result, gl.vm.Return):
                 return False
             data = leader_result.calldata
-            leader_price = int(data["price_cents"])
+            if not isinstance(data, dict):
+                return False
+            try:
+                leader_price = int(data["price_cents"])
+            except (KeyError, TypeError, ValueError):
+                return False
+            if isinstance(data.get("price_cents"), bool) or leader_price <= 0:
+                return False
             # leader must be self-consistent ...
-            if data["outcome"] != _price_outcome(comparator, leader_price, target):
+            if data.get("outcome") != _price_outcome(comparator, leader_price, target):
                 return False
             # ... and its observation close to ours
-            return _within_tolerance(leader_price, _fetch_price_cents(asset_id))
+            try:
+                mine = _fetch_price_cents(asset_id)
+            except Exception:
+                return False
+            return _within_tolerance(leader_price, mine)
 
         res = gl.vm.run_nondet_unsafe(leader_fn, validator_fn)
         return {
@@ -326,9 +441,18 @@ class PredictionResolver(gl.Contract):
         def validator_fn(leader_result) -> bool:
             if not isinstance(leader_result, gl.vm.Return):
                 return False
-            mine = _judge_event(question, url, resolve_after)
+            data = leader_result.calldata
+            if not isinstance(data, dict):
+                return False
+            leader_outcome = data.get("outcome")
+            if leader_outcome not in ("YES", "NO", "UNRESOLVED"):
+                return False
+            try:
+                mine = _judge_event(question, url, resolve_after)
+            except Exception:
+                return False
             # agree on the verdict only; evidence wording may differ
-            return leader_result.calldata["outcome"] == mine["outcome"]
+            return leader_outcome == mine["outcome"]
 
         res = gl.vm.run_nondet_unsafe(leader_fn, validator_fn)
         return {"outcome": res["outcome"], "observed": res["evidence"]}
@@ -371,7 +495,13 @@ class PredictionResolver(gl.Contract):
         if len(q) < 10 or len(q) > MAX_QUESTION_LEN:
             raise gl.vm.UserError("Question must be 10-280 characters")
         url = str(resolution_url).strip()
-        if not url.startswith("https://") or len(url) > 512:
+        host = url[len("https://") :] if url.startswith("https://") else ""
+        if (
+            not host
+            or host.startswith("/")
+            or len(url) > 512
+            or any(ch.isspace() for ch in url)
+        ):
             raise gl.vm.UserError("Resolution URL must be an https:// URL")
         after = self._validate_resolve_after(resolve_after)
 

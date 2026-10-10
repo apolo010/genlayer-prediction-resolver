@@ -1,5 +1,7 @@
 # GenLayer Prediction Resolver
 
+[![CI](https://github.com/apolo010/genlayer-prediction-resolver/actions/workflows/ci.yml/badge.svg)](https://github.com/apolo010/genlayer-prediction-resolver/actions/workflows/ci.yml)
+
 An **Intelligent Contract** on [GenLayer](https://genlayer.com) that turns the
 open web into a prediction market oracle. Users register predictions and anyone
 can resolve them once the deadline passes. Validators reach consensus on
@@ -104,18 +106,80 @@ genlayer call  $C get_leaderboard --args 10
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
-# lint (GenVM linter)
+ruff check .
 genvm-lint check contracts/prediction_resolver.py
 
-# fast in-memory tests, with web + LLM mocked (16 tests)
+# in-memory tests; web + LLM are mocked (no GenLayer node)
 pytest tests/direct/ -v
 ```
 
-The direct-mode tests cover creation and input validation, price resolution
-(including the LLM fallback when the API rate-limits), event resolution, the
-`UNRESOLVED` revert, **validator behaviour** (tolerance band, a lying leader,
-a leader error, verdict-only comparison via `run_validator`), deadline
-enforcement, cancel permissions, pagination, and leaderboard ordering.
+Tests use [genlayer-test](https://docs.genlayer.com/api-references/genlayer-test)
+direct mode (`pytest`, not a live studio). The `genlayer-test` plugin provides
+`direct_vm` / `direct_deploy` and the `mock_web`, `mock_llm`, `expect_revert`,
+and `run_validator` cheatcodes. Nondeterministic `gl.nondet.web` and
+`gl.nondet.exec_prompt` calls are mocked; validator functions captured from
+`gl.vm.run_nondet_unsafe` are re-run with `direct_vm.run_validator`.
+
+The suite covers creation and input bounds, strict above/below outcomes
+(including the one-cent boundary and half-up rounding of API prices), price
+resolution with the LLM fallback, event resolution, garbled-LLM and
+`UNRESOLVED` reverts, validator tolerance (including a lying or malformed
+leader and verdict-only comparison), deadline inclusivity, cancel
+permissions, pagination, and leaderboard ordering.
+
+GitHub Actions (`.github/workflows/ci.yml`) runs ruff, `genvm-lint`, and
+`pytest tests/direct/` on every push and pull request.
+
+## Design decisions
+
+The Studionet address above is the bytecode already deployed. The fixes in
+this repo (cent rounding, stricter `https` checks, validators returning
+`False` on a bad leader payload) keep the same method signatures and storage
+layout, and they take effect on the next deploy.
+
+* **Cents, not floats.** Targets are parsed as exact decimal strings (at most
+  two places) and stored as integer cents. Observed prices are parsed from
+  the JSON number's original text and rounded half-up, because
+  `int(round(float(x) * 100))` is wrong for values such as `1.005` and
+  `8.995`. A price equal to the target is **NO** for both `above` and
+  `below` (the comparison is strict).
+* **Deadline is inclusive.** `resolve` succeeds when the block time is
+  greater than or equal to `resolve_after`. Naive datetimes are read as UTC
+  and offsets are normalized before storage.
+* **Price consensus is a 1.5% band.** Validators re-fetch the price and
+  accept the leader when the two observations are within 1.5% of the larger
+  one and the leader's outcome matches its own price. Evidence text is not
+  compared. Event consensus compares the verdict only.
+* **Failure leaves the prediction open.** `UNRESOLVED`, a garbled model
+  answer, or a missing price reverts the transaction. Nothing is written, so
+  a later call can try again.
+* **Scoring.** A price prediction is the creator's own claim (`above` /
+  `below`), so they score as predicting YES. Event creators choose
+  `predicts_yes`. A point is awarded only when the outcome matches that
+  claim.
+
+Reviewed and left unchanged, on purpose:
+
+* **Near the strike, the leader's side wins.** If the spot price sits inside
+  the 1.5% band of the target, a validator can agree even when its own price
+  would resolve the other way. Requiring the outcome to be stable across the
+  band would be safer, and it would also make markets inside that band fail
+  consensus until the price moves. That is a different product rule than the
+  one deployed on Studionet.
+* **Creators can cancel after the deadline**, until someone resolves. That
+  lets a creator drop a prediction once the outcome is knowable. Disallowing
+  cancel once `resolve_after` has passed would close that hole and would
+  change the live contract's rules.
+* **Prompt injection is only partially mitigated.** The prompts tell the
+  model to treat page text as data. The event question and resolution URL
+  are still interpolated into the instruction text, so a crafted question can
+  try to steer the verdict. Delimiting that text (and rejecting questions
+  that contain the delimiter) would harden it, and it would also change the
+  prompt the deployed contract uses.
+* **No fees, pause, or resolution allowlist.** `owner` is recorded and not
+  consulted. Anyone can create predictions and anyone can resolve them, and
+  event URLs may be any `https` host. A fee or an allowlist would need new
+  method arguments or storage.
 
 ## Deploy
 

@@ -2,25 +2,24 @@
 
 import json
 
-from tests.direct.conftest import CONTRACT, to_hex
-
-PAST = "2026-01-01T00:00:00Z"
-FUTURE = "2099-01-01T00:00:00Z"
-CG_API = r".*api\.coingecko\.com/api/v3/simple/price.*"
-CG_PAGE = r".*coingecko\.com/en/coins/.*"
-NEWS = r".*example\.org/news.*"
+from tests.direct.conftest import (
+    CG_API,
+    CG_PAGE,
+    CONTRACT,
+    FUTURE,
+    PAST,
+    mock_event,
+    mock_price,
+    to_hex,
+)
 
 
 def _mock_price(vm, usd):
-    vm.mock_web(CG_API, {"status": 200, "body": json.dumps({"bitcoin": {"usd": usd}})})
+    mock_price(vm, usd)
 
 
 def _mock_event(vm, outcome, evidence="source says so"):
-    vm.mock_web(NEWS, {"status": 200, "body": "Some article text"})
-    vm.mock_llm(
-        r".*impartial prediction-market resolver.*",
-        json.dumps({"outcome": outcome, "evidence": evidence}),
-    )
+    mock_event(vm, outcome, evidence)
 
 
 # ── creation ────────────────────────────────────────────────────────────────

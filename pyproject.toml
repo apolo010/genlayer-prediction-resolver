@@ -3,3 +3,16 @@ testpaths = ["tests"]
 markers = [
     "integration: tests requiring GenLayer Studio (run with gltest)",
 ]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+extend-exclude = [".venv", "artifacts"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+
+[tool.ruff.lint.per-file-ignores]
+# The contract imports the GenLayer SDK with a star import, which is the
+# supported style (Address, u256, DynArray, TreeMap, gl).
+"contracts/prediction_resolver.py" = ["E501", "F403", "F405"]

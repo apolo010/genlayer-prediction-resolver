@@ -281,3 +281,41 @@ def test_pagination_and_leaderboard_order(
         {"user": to_hex(direct_charlie), "points": 2},
     ]
     assert c.get_user_predictions(to_hex(direct_bob)) == [1, 2, 3]
+
+
+# ── consensus fix: validators derive their own outcome ─────────────────────
+
+
+def test_validator_rejects_opposite_outcome_within_tolerance(direct_vm, direct_deploy, direct_alice):
+    """Steward's scenario: leader just above target, validator just below."""
+    c = direct_deploy(CONTRACT)
+    direct_vm.sender = direct_alice
+    c.create_price_prediction("bitcoin", "above", "50000", PAST)
+    _mock_price(direct_vm, 50800)  # +1.6 % -> decisive YES
+    assert c.resolve(0) == "YES"
+
+    # validator sees 49 900: its own outcome is UNDETERMINED -> must reject
+    direct_vm.clear_mocks()
+    _mock_price(direct_vm, 49900)
+    assert direct_vm.run_validator() is False
+
+    # crafted leader result: price just above target, validator just below,
+    # prices only 0.4 % apart -> old code would have accepted, now rejected
+    direct_vm.clear_mocks()
+    _mock_price(direct_vm, 49900)
+    assert direct_vm.run_validator(leader_result={"price_cents": 5010000, "outcome": "YES"}) is False
+
+    # validator clearly on the same side -> accepts
+    direct_vm.clear_mocks()
+    _mock_price(direct_vm, 51000)
+    assert direct_vm.run_validator() is True
+
+
+def test_near_threshold_is_undetermined(direct_vm, direct_deploy, direct_alice):
+    c = direct_deploy(CONTRACT)
+    direct_vm.sender = direct_alice
+    c.create_price_prediction("bitcoin", "above", "50000", PAST)
+    _mock_price(direct_vm, 50500)  # +1 % -> inside dead zone
+    with direct_vm.expect_revert("price too close to target"):
+        c.resolve(0)
+    assert c.get_prediction(0)["status"] == "open"

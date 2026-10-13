@@ -6,9 +6,11 @@ Anyone can register a prediction of one of two kinds:
 
 * ``price``  — "asset X will be above/below $Y after date D".
                Resolved from the public CoinGecko API (with an LLM-read
-               fallback of the CoinGecko coin page). Validators accept the
-               leader's price if it lies within a tolerance band of their
-               own observation (comparative equivalence, custom validator).
+               fallback of the CoinGecko coin page). Each validator fetches
+               its own price, computes its own YES/NO/UNDETERMINED outcome
+               and requires it to strictly equal the leader's outcome (plus
+               a 1.5 % price-plausibility check). Prices within 1.5 % of the
+               target are UNDETERMINED and the resolve call reverts (retry).
 * ``event``  — free-form yes/no statement + a public resolution URL.
                Resolved by rendering the page and asking an LLM for a
                YES / NO / UNRESOLVED verdict. Validators re-run the same
@@ -38,6 +40,12 @@ MAX_QUESTION_LEN = 280
 MAX_EVIDENCE_LEN = 280
 MAX_PAGE_CHARS = 12000
 PRICE_TOLERANCE_BPS = 150  # 1.5 % band between leader and validator prices
+# Dead zone around the target: if an observed price is this close to the target
+# the outcome is UNDETERMINED (resolve reverts, retry later). It must be >=
+# PRICE_TOLERANCE_BPS so two honest observations within tolerance can never sit
+# on opposite sides of the target with both producing a decisive YES/NO.
+NEAR_THRESHOLD_BPS = 150
+OUTCOME_UNDETERMINED = "UNDETERMINED"
 MAX_PAGE_SIZE = 50
 
 
@@ -108,6 +116,9 @@ def _cents_to_usd(cents: int) -> str:
 
 
 def _price_outcome(comparator: str, price_cents: int, target_cents: int) -> str:
+    """YES / NO, or UNDETERMINED when the price is inside the dead zone."""
+    if abs(price_cents - target_cents) * 10000 <= target_cents * NEAR_THRESHOLD_BPS:
+        return OUTCOME_UNDETERMINED
     if comparator == "above":
         return "YES" if price_cents > target_cents else "NO"
     return "YES" if price_cents < target_cents else "NO"
@@ -303,11 +314,16 @@ class PredictionResolver(gl.Contract):
                 return False
             data = leader_result.calldata
             leader_price = int(data["price_cents"])
-            # leader must be self-consistent ...
+            # 1. leader must be self-consistent
             if data["outcome"] != _price_outcome(comparator, leader_price, target):
                 return False
-            # ... and its observation close to ours
-            return _within_tolerance(leader_price, _fetch_price_cents(asset_id))
+            # 2. validator independently derives the outcome from ITS OWN price
+            #    and requires strict equality with the leader's outcome
+            my_price = _fetch_price_cents(asset_id)
+            if _price_outcome(comparator, my_price, target) != data["outcome"]:
+                return False
+            # 3. the reported observation must also be plausible
+            return _within_tolerance(leader_price, my_price)
 
         res = gl.vm.run_nondet_unsafe(leader_fn, validator_fn)
         return {
@@ -397,6 +413,10 @@ class PredictionResolver(gl.Contract):
 
         outcome = result["outcome"]
         if outcome not in ("YES", "NO"):
+            if outcome == OUTCOME_UNDETERMINED:
+                raise gl.vm.UserError(
+                    "Outcome cannot be determined yet: price too close to target, retry later"
+                )
             raise gl.vm.UserError("Outcome cannot be determined yet")
 
         p.status = STATUS_RESOLVED

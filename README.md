@@ -22,10 +22,18 @@ Two kinds of predictions are supported:
 
 Both resolvers use `gl.vm.run_nondet_unsafe` with **custom validator functions**:
 
-* **Price:** the validator checks that the leader's outcome matches the leader's
-  own price. It then fetches the price itself and accepts if the two prices are
-  within **1.5%** of each other. A tolerance band is needed because prices move
-  between nodes, so exact equality would never reach agreement.
+* **Price (outcome-equivalence, not just price tolerance):** every validator
+  1. checks the leader is self-consistent (leader outcome == outcome of leader's price),
+  2. fetches the price **itself**, computes **its own** `YES` / `NO` /
+     `UNDETERMINED` outcome and requires it to be **strictly equal** to the
+     leader's outcome,
+  3. additionally requires the two prices to be within **1.5%** (plausibility).
+* **Near-threshold dead zone:** if an observed price is within **1.5%** of the
+  target, the outcome is `UNDETERMINED` and `resolve` reverts with
+  *"price too close to target, retry later"*; the prediction stays open. Because
+  the dead zone (1.5%) is >= the price tolerance, a decisive outcome can only be
+  finalized when every agreeing node independently landed on the same side of
+  the target with margin.
 * **Event:** the validator re-runs the render + LLM pipeline and compares
   **only the verdict**. Different wording of the evidence is fine.
 * If the leader errors, the validators disagree.
@@ -33,6 +41,17 @@ Both resolvers use `gl.vm.run_nondet_unsafe` with **custom validator functions**
   prediction stays open and can be retried later.
 * The prompts tell the model to treat page content as data and ignore any
   instructions in it (prompt-injection hardening).
+
+### Security fix (v2): opposite outcomes can no longer both be approved
+
+v1 validators only checked that the leader's price was within 1.5% of their own
+and that the leader's outcome matched the *leader's* price. With a target of
+$50,000, a leader seeing $50,100 (YES) and a validator seeing $49,900 (NO) are
+only 0.4% apart, so the validator approved YES even though its own data said NO.
+v2 fixes this with step 2 above (validator-derived outcome must equal the
+leader's) plus the near-threshold dead zone. Regression tests:
+`test_validator_rejects_opposite_outcome_within_tolerance`,
+`test_near_threshold_is_undetermined`.
 
 ### On-chain state
 
@@ -73,11 +92,21 @@ resolves in their favour.
 
 | | |
 |---|---|
-| Contract | [`0x8f64A7149c3121d355300927E46AC323E34D1d8b`](https://explorer-studio.genlayer.com/address/0x8f64A7149c3121d355300927E46AC323E34D1d8b) |
-| Deploy tx | [`0x3bdcd21def637f12ab4b14b7b16d9e01bbd04203b15c9be5f20393ba0c5e34e5`](https://explorer-studio.genlayer.com/tx/0x3bdcd21def637f12ab4b14b7b16d9e01bbd04203b15c9be5f20393ba0c5e34e5) (FINALIZED, MAJORITY_AGREE) |
+| Contract (v2, fixed) | [`0x9d703ef1DD55B1A0e350a7BF0c667ad6Bd7A6A87`](https://explorer-studio.genlayer.com/address/0x9d703ef1DD55B1A0e350a7BF0c667ad6Bd7A6A87) |
+| Deploy tx (v2) | [`0xfdd46de0…bf0d`](https://explorer-studio.genlayer.com/tx/0xfdd46de003baf2518404b36c6c598ff990b7d019a3a41bd3e9fda98c8e95bf0d) |
+| Previous v1 (superseded) | `0x8f64A7149c3121d355300927E46AC323E34D1d8b` |
 | Network | Studionet, RPC `https://studio.genlayer.com/api`, chain id `61999` |
 
-Demo transactions on the live contract (all `MAJORITY_AGREE`):
+Demo transactions on the v2 contract (all `MAJORITY_AGREE`):
+
+| Action | Tx | Result |
+|--------|----|--------|
+| `create_price_prediction(ethereum, below, 1000000, 2026-01-01T00:00:00Z)` | [`0x9577634c…04f5`](https://explorer-studio.genlayer.com/tx/0x9577634c8bd91e9c3948d94c7293203cb5b5ea25e50bcffabb675393d13b04f5) | id `1` |
+| `resolve(1)`: validators derive their own outcome | [`0x4d3dcad9…ca9b`](https://explorer-studio.genlayer.com/tx/0x4d3dcad92707a115ed9bc058237d276ed3f1cf9ced9e7a568c820337900dca9b) | `YES`, `price_usd=2533.09` |
+
+(id `0`, bitcoin above 1000, also resolved `YES`, `price_usd=84043.00`.)
+
+Earlier demo transactions on the v1 contract:
 
 | Action | Tx | Result |
 |--------|----|--------|
@@ -90,11 +119,11 @@ Try it yourself:
 
 ```bash
 genlayer network set studionet
-C=0x8f64A7149c3121d355300927E46AC323E34D1d8b
+C=0x9d703ef1DD55B1A0e350a7BF0c667ad6Bd7A6A87
 genlayer call  $C get_stats
 genlayer call  $C get_predictions --args 0 10
 genlayer write $C create_price_prediction --args ethereum above 1000 2026-01-01T00:00:00Z
-genlayer write $C resolve --args 2
+genlayer write $C resolve --args 2   # reverts if price is within 1.5% of target
 genlayer call  $C get_leaderboard --args 10
 ```
 
@@ -107,13 +136,13 @@ pip install -r requirements.txt
 # lint (GenVM linter)
 genvm-lint check contracts/prediction_resolver.py
 
-# fast in-memory tests, with web + LLM mocked (16 tests)
+# fast in-memory tests, with web + LLM mocked (18 tests)
 pytest tests/direct/ -v
 ```
 
 The direct-mode tests cover creation and input validation, price resolution
 (including the LLM fallback when the API rate-limits), event resolution, the
-`UNRESOLVED` revert, **validator behaviour** (tolerance band, a lying leader,
+`UNRESOLVED` revert, **validator behaviour** (own-outcome equality, near-threshold dead zone, tolerance band, a lying leader,
 a leader error, verdict-only comparison via `run_validator`), deadline
 enforcement, cancel permissions, pagination, and leaderboard ordering.
 
